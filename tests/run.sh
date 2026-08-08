@@ -6,7 +6,7 @@
 # (payload, headers, header-file mode, argv) into a per-case capture dir.
 # Nothing here depends on user paths, real credentials, or the host's
 # HERMES_DIR; every case builds its own temporary config and .env.
-# shellcheck disable=SC2329 # case_* / expect_* helpers are dispatched dynamically ("case_${name}", run_probe env)
+# shellcheck disable=SC2317,SC2329 # case_* / expect_* helpers are dispatched dynamically ("case_${name}", run_probe env)
 set -euo pipefail
 
 ROOT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
