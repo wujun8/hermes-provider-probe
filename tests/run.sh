@@ -284,8 +284,10 @@ YAML
   expect_url 1 '/responses'
 }
 
-case_html_no_fallback() {
+case_html_400_no_fallback() {
   new_case
+  # HTTP 400 is the fallback trigger code, yet a non-JSON (HTML) body must
+  # still fail closed before any fallback: no /chat/completions retry.
   write_config <<'YAML'
 model:
   provider: custom:fixture
@@ -295,12 +297,15 @@ custom_providers:
     key_env: FIXTURE_API_KEY
 YAML
   write_env
-  run_probe FAKE_RESPONSES_CODE=403 FAKE_RESPONSES_CT=text/html \
+  run_probe FAKE_RESPONSES_CODE=400 FAKE_RESPONSES_CT=text/html \
     FAKE_RESPONSES_BODY='<!DOCTYPE html><html><body>blocked</body></html>'
   expect_status 1
   expect_stdout '[FAIL]'
   expect_stdout 'non-JSON'
+  # The body gate must reject before the 400 fallback: exactly one call,
+  # to /responses, and no second call to /chat/completions.
   expect_capture_count 1
+  expect_url 1 '/responses'
 }
 
 case_sse_truncated() {
@@ -536,7 +541,7 @@ run_case fallback_400_chat_primary
 for code in 401 403 429 500 503; do
   run_case no_fallback "$code"
 done
-run_case html_no_fallback
+run_case html_400_no_fallback
 run_case sse_truncated
 run_case sse_error_event
 run_case chat_truncated
