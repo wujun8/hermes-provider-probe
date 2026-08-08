@@ -57,7 +57,8 @@
 - `model.base_url` 缺失时，从 `providers` / `custom_providers`（list 与 dict
   两种写法均支持）中按名称或归一化 URL 匹配条目取回 base_url。
 - 密钥来源优先级：`model.api_key`（支持 `${ENV}` 引用）→ 匹配 provider 条目的
-  `key_env` / `api_key` → 兼容环境变量（`CODEX_API_KEY` 等）。找不到密钥时退出码 2。
+  `key_env` / `api_key` → 兼容环境变量（`CODEX_API_KEY` 等）。找不到密钥时探测失败，
+  外部退出码为 1。
 - 输出提示词按 endpoint 准确说明 token 策略：Responses 使用 provider default，
   Chat 使用 `max_tokens: 1`。
 
@@ -98,5 +99,4 @@ synthetic key、覆盖以下场景：
 | 退出码 | 含义 |
 | --- | --- |
 | `0` | 探测成功（`[PASS]`） |
-| `1` | 探测失败：配置缺失、curl 错误、HTTP 非 200、响应 shape 异常 |
-| `2` | 配置解析/密钥问题：PyYAML 缺失、必需环境变量缺失、非法 header 等 |
+| `1` | 所有探测失败：配置/解析、密钥/header、curl、HTTP 非 200、响应 shape 异常等 |

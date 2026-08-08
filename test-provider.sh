@@ -100,7 +100,7 @@ python3 - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed
 import os
 import re
 import sys
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 try:
     import yaml
@@ -113,7 +113,7 @@ with open(config_path, encoding="utf-8") as fh:
     cfg = yaml.safe_load(fh) or {}
 model = cfg.get("model") or {}
 provider = str(model.get("provider") or "unknown")
-base_url = str(model.get("base_url") or "").rstrip("/")
+base_url = str(model.get("base_url") or "")
 default_model = str(model.get("default") or "")
 api_mode = str(model.get("api_mode") or "codex_responses")
 context_length = str(model.get("context_length") or "")
@@ -130,6 +130,37 @@ def expand(value, label):
 def exact_env_ref(value):
     match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", str(value).strip())
     return match.group(1) if match else None
+
+def invalid_base_url():
+    sys.stderr.write("Invalid base URL configuration\n")
+    sys.exit(2)
+
+def validate_base_url(value):
+    raw = str(value or "")
+    if not raw or any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f for char in raw):
+        invalid_base_url()
+    if "?" in raw or "#" in raw:
+        invalid_base_url()
+    try:
+        parsed = urlsplit(raw)
+        hostname = parsed.hostname
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            invalid_base_url()
+        authority = parsed.netloc
+        if "@" in authority or "@" in unquote(authority):
+            invalid_base_url()
+        if authority.startswith("["):
+            closing = authority.find("]")
+            suffix = authority[closing + 1:]
+            if suffix == ":" or (suffix and (not suffix.startswith(":") or not suffix[1:].isdigit())):
+                invalid_base_url()
+        elif ":" in authority:
+            if authority.count(":") != 1 or not authority.rsplit(":", 1)[1].isdigit():
+                invalid_base_url()
+        parsed.port
+    except (TypeError, ValueError):
+        invalid_base_url()
+    return raw
 
 def normalize_route(value):
     raw = str(value or "")
@@ -200,6 +231,10 @@ def provider_route(entry):
             return value
     return None
 
+if base_url:
+    validate_base_url(base_url)
+    base_url = base_url.rstrip("/")
+
 def matching_provider_entry(*, require_credentials=True, require_route=False):
     provider_names = {provider}
     if ":" in provider:
@@ -225,7 +260,8 @@ def matching_provider_entry(*, require_credentials=True, require_route=False):
 
 provider_route_entry = matching_provider_entry(require_credentials=False, require_route=True)
 if not base_url and provider_route_entry is not None:
-    base_url = str(provider_route(provider_route_entry) or "").rstrip("/")
+    base_url = validate_base_url(provider_route(provider_route_entry))
+    base_url = base_url.rstrip("/")
 
 # Explicit current-model/provider configuration always wins. Compatibility
 # environment variables are consulted only when neither declares a key.
@@ -692,6 +728,74 @@ PY
   exit 1
 }
 
+validate_json_response() {
+  local endpoint="$1" body_file="$2" result
+  if result=$(python3 - "$endpoint" "$body_file" <<'PY'
+import json
+import sys
+
+endpoint, body_path = sys.argv[1:]
+
+
+def fail(message):
+    print(message[:300])
+    raise SystemExit(1)
+
+
+def usage_tokens(usage):
+    if not isinstance(usage, dict):
+        return None
+    total = usage.get("total_tokens")
+    if isinstance(total, int) and not isinstance(total, bool):
+        return str(total)
+    input_tokens = usage.get("input_tokens")
+    output_tokens = usage.get("output_tokens")
+    if all(isinstance(value, int) and not isinstance(value, bool)
+           for value in (input_tokens, output_tokens)):
+        return str(input_tokens + output_tokens)
+    return None
+
+
+try:
+    with open(body_path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+except (OSError, ValueError):
+    fail("body is not valid JSON")
+
+if not isinstance(payload, dict):
+    fail("top-level JSON value is not an object")
+if payload.get("error") is not None:
+    fail("error envelope")
+
+if endpoint == "/responses":
+    if payload.get("status") != "completed":
+        fail("status is not completed")
+    if not isinstance(payload.get("output"), list):
+        fail("output is not an array")
+    print(usage_tokens(payload.get("usage")) or "unknown")
+else:
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        fail("choices is not a non-empty array")
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        fail("first choice is not an object")
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        fail("first choice has no message object")
+    content = message.get("content")
+    if not isinstance(content, str) or not content:
+        fail("assistant message content is empty or not a string")
+    print(usage_tokens(payload.get("usage")) or "unknown")
+PY
+  ); then
+    TOKENS="$result"
+    return 0
+  fi
+  echo "[FAIL] Unexpected ${endpoint} JSON response: ${result:-invalid JSON response}"
+  exit 1
+}
+
 try_responses() {
   local payload
   # The upstream rejects /responses requests that carry max_output_tokens:
@@ -749,24 +853,8 @@ fi
 # Validate response shape.
 if response_content_type_is_sse "$RESPONSE_HEADERS_FILE"; then
   validate_sse_response "$ENDPOINT_USED" "$RESPONSE_FILE"
-elif [[ "$ENDPOINT_USED" == "/responses" ]]; then
-  HAS_OUTPUT=$(echo "$RESPONSE_BODY" | jq -e '(.output != null) or (.status != null)' >/dev/null 2>&1 && echo yes || echo no)
-  if [[ "$HAS_OUTPUT" != "yes" ]]; then
-    echo "[FAIL] Unexpected ${ENDPOINT_USED} payload: $(echo "$RESPONSE_BODY" | jq -c '.' 2>/dev/null || echo "$RESPONSE_BODY")"
-    exit 1
-  fi
-  TOKENS=$(echo "$RESPONSE_BODY" | jq -r '
-    if .usage.total_tokens then .usage.total_tokens
-    elif (.usage.input_tokens // 0) + (.usage.output_tokens // 0) > 0
-      then ((.usage.input_tokens // 0) + (.usage.output_tokens // 0))
-    else "unknown" end' 2>/dev/null || echo "unknown")
 else
-  HAS_CHOICES=$(echo "$RESPONSE_BODY" | jq -e '.choices | length > 0' >/dev/null 2>&1 && echo yes || echo no)
-  if [[ "$HAS_CHOICES" != "yes" ]]; then
-    echo "[FAIL] Unexpected ${ENDPOINT_USED} payload: $(echo "$RESPONSE_BODY" | jq -c '.' 2>/dev/null || echo "$RESPONSE_BODY")"
-    exit 1
-  fi
-  TOKENS=$(echo "$RESPONSE_BODY" | jq -r '.usage.total_tokens // "unknown"' 2>/dev/null || echo "unknown")
+  validate_json_response "$ENDPOINT_USED" "$RESPONSE_FILE"
 fi
 
 echo "[PASS] Provider is available. Tokens used: ${TOKENS}"

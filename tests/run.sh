@@ -61,6 +61,12 @@ run_probe() {
     -u TEST_MODEL -u LIST_MODELS -u CURL_TIMEOUT -u FIXTURE_API_KEY \
     -u OPENAI_API_KEY -u CODEX_API_KEY -u OPENROUTER_API_KEY -u ANTHROPIC_API_KEY \
     -u DEEPSEEK_API_KEY -u GLM_API_KEY -u KIMI_API_KEY -u BAILIAN_API_KEY -u AGNES_API_KEY \
+    -u FAKE_CURL_FAIL \
+    -u FAKE_RESPONSES_CODE -u FAKE_RESPONSES_BODY -u FAKE_RESPONSES_CT \
+    -u FAKE_RESPONSES_ERROR_STREAM -u FAKE_RESPONSES_TRUNCATED \
+    -u FAKE_CHAT_CODE -u FAKE_CHAT_BODY -u FAKE_CHAT_CT \
+    -u FAKE_CHAT_ERROR_STREAM -u FAKE_CHAT_TRUNCATED \
+    -u FAKE_MODELS_CODE -u FAKE_MODELS_BODY -u FAKE_MODELS_CT \
     PATH="$CASE_DIR/bin:$PATH" \
     HERMES_DIR="$CASE_DIR/hermes" \
     FAKE_CAPTURE_DIR="$CASE_DIR/capture" \
@@ -145,6 +151,17 @@ expect_no_key_in() {
   fi
 }
 
+expect_no_text_in_case() {
+  local needle="$1"
+  local path
+  for path in "$CASE_DIR/stdout" "$CASE_DIR/stderr" "$CASE_DIR"/capture/*; do
+    [[ -f "$path" ]] || continue
+    if grep -Fq -- "$needle" "$path"; then
+      fail "forbidden fixture text leaked"
+    fi
+  done
+}
+
 case_basic_responses() {
   new_case
   write_config <<'YAML'
@@ -212,6 +229,332 @@ YAML
   expect_payload_field 1 '.max_tokens' '1'
   expect_payload_true 1 'has("max_output_tokens") | not'
   expect_payload_field 1 '.model' 'probe-explicit-model'
+}
+
+case_responses_json_status_error_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_RESPONSES_CT=application/json \
+    FAKE_RESPONSES_BODY='{"status":"error","marker":"RESPONSES_STATUS_ERROR_MARKER"}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /responses JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'RESPONSES_STATUS_ERROR_MARKER'
+}
+
+case_responses_json_valid_empty_output() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_RESPONSES_CT=application/json \
+    FAKE_RESPONSES_BODY='{"status":"completed","output":[],"usage":{"total_tokens":1}}'
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_stdout 'Tokens used: 1'
+  expect_quiet_stderr
+  expect_capture_count 1
+}
+
+case_responses_json_error_envelope_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_RESPONSES_CT=application/json \
+    FAKE_RESPONSES_BODY='{"status":"completed","output":[],"error":{"message":"RESPONSES_ERROR_ENVELOPE_MARKER"}}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /responses JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'RESPONSES_ERROR_ENVELOPE_MARKER'
+}
+
+case_responses_json_non_array_output_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_RESPONSES_CT=application/json \
+    FAKE_RESPONSES_BODY='{"status":"completed","output":{},"marker":"RESPONSES_OUTPUT_SHAPE_MARKER"}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /responses JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'RESPONSES_OUTPUT_SHAPE_MARKER'
+}
+
+case_chat_json_choices_string_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"choices":"x","marker":"CHAT_CHOICES_SHAPE_MARKER"}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'CHAT_CHOICES_SHAPE_MARKER'
+}
+
+case_chat_json_empty_choices_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json FAKE_CHAT_BODY='{"choices":[]}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+}
+
+case_chat_json_valid_message() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"choices":[{"message":{"role":"assistant","content":"OK"}}],"usage":{"total_tokens":1}}'
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_stdout 'Tokens used: 1'
+  expect_quiet_stderr
+  expect_capture_count 1
+}
+
+case_chat_json_empty_content_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"choices":[{"message":{"role":"assistant","content":""}}]}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+}
+
+case_chat_json_non_string_content_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"choices":[{"message":{"role":"assistant","content":[]}}]}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+}
+
+case_chat_json_error_envelope_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"error":{"message":"CHAT_ERROR_ENVELOPE_MARKER"},"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'CHAT_ERROR_ENVELOPE_MARKER'
+}
+
+case_explicit_base_url_userinfo_rejected() {
+  local marker='URL_USERINFO_SYNTHETIC_SECRET'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: "http://fixture-user:${marker}@127.0.0.1:18081/v1"
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_explicit_base_url_empty_userinfo_rejected() {
+  local marker='URL_EMPTY_USERINFO_SYNTHETIC_MARKER'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: "http://@127.0.0.1:18081/v1/${marker}"
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_explicit_base_url_percent_encoded_userinfo_rejected() {
+  local marker='URL_PERCENT_USERINFO_SYNTHETIC_SECRET'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: "http://fixture%2Duser%3A${marker}%40example.com/v1"
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_explicit_base_url_query_rejected() {
+  local marker='URL_QUERY_SYNTHETIC_SECRET'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: "http://127.0.0.1:18081/v1?api_key=${marker}"
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_explicit_base_url_fragment_rejected() {
+  local marker='URL_FRAGMENT_SYNTHETIC_SECRET'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: "http://127.0.0.1:18081/v1#token=${marker}"
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_fallback_base_url_userinfo_rejected() {
+  local marker='FALLBACK_URL_USERINFO_SYNTHETIC_SECRET'
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+custom_providers:
+  - name: fixture
+    base_url: "http://fixture-user:${marker}@127.0.0.1:18081/v1"
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_no_text_in_case "$marker"
+  expect_capture_count 0
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+}
+
+case_valid_ipv6_trailing_slash_base_url() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://[::1]:18081/v1/
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_capture_count 1
+  expect_url 1 'http://[::1]:18081/v1/responses'
 }
 
 case_fallback_400_responses_primary() {
@@ -536,6 +879,23 @@ echo
 
 run_case basic_responses
 run_case chat_explicit
+run_case responses_json_status_error_rejected
+run_case responses_json_valid_empty_output
+run_case responses_json_error_envelope_rejected
+run_case responses_json_non_array_output_rejected
+run_case chat_json_choices_string_rejected
+run_case chat_json_empty_choices_rejected
+run_case chat_json_valid_message
+run_case chat_json_empty_content_rejected
+run_case chat_json_non_string_content_rejected
+run_case chat_json_error_envelope_rejected
+run_case explicit_base_url_userinfo_rejected
+run_case explicit_base_url_empty_userinfo_rejected
+run_case explicit_base_url_percent_encoded_userinfo_rejected
+run_case explicit_base_url_query_rejected
+run_case explicit_base_url_fragment_rejected
+run_case fallback_base_url_userinfo_rejected
+run_case valid_ipv6_trailing_slash_base_url
 run_case fallback_400_responses_primary
 run_case fallback_400_chat_primary
 for code in 401 403 429 500 503; do
