@@ -1,0 +1,28 @@
+# Local Hermes configuration and credentials
+.env
+**/.env
+config.yaml
+**/config.yaml
+.hermes/
+
+# Credentials and private material
+*.key
+*.pem
+*.token
+*.secret
+*.credentials
+
+# Logs, captures, and temporary artifacts
+*.log
+*.capture
+*.headers
+*.args
+*.body
+*.out
+*.err
+*.tmp
+capture.*
+captures/
+tmp/
+temp/
+.DS_Store

@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Hermetic fake curl for tests/run.sh.
+
+Never touches the network. Parses the curl invocation issued by
+test-provider.sh, records it (argv, URL, payload, request headers and the
+header file's mode) into $FAKE_CAPTURE_DIR, then answers from scenario
+environment variables so tests can script HTTP codes, content types,
+truncated SSE streams and failure modes without any external service.
+"""
+import json
+import os
+import sys
+
+CAPTURE = os.environ.get("FAKE_CAPTURE_DIR", "")
+
+
+def env(name, default=""):
+    return os.environ.get(name, default)
+
+
+argv = sys.argv[1:]
+body_path = None
+headers_path = None
+payload = None
+url = None
+header_files = []
+i = 0
+while i < len(argv):
+    arg = argv[i]
+    if arg in ("-o", "-D", "-d", "-H", "-w", "--max-time"):
+        if i + 1 >= len(argv):
+            sys.stderr.write("fake curl: missing value for %s\n" % arg)
+            sys.exit(2)
+        value = argv[i + 1]
+        if arg == "-o":
+            body_path = value
+        elif arg == "-D":
+            headers_path = value
+        elif arg == "-d":
+            payload = value
+        elif arg == "-H" and value.startswith("@"):
+            header_files.append(value[1:])
+        i += 2
+    elif arg.startswith("-"):
+        i += 1
+    else:
+        url = arg
+        i += 1
+
+if CAPTURE:
+    os.makedirs(CAPTURE, exist_ok=True)
+    seq_file = os.path.join(CAPTURE, "seq")
+    try:
+        with open(seq_file, "r", encoding="ascii") as fh:
+            n = int(fh.read().strip() or "0") + 1
+    except (OSError, ValueError):
+        n = 1
+    with open(seq_file, "w", encoding="ascii") as fh:
+        fh.write(str(n))
+    with open(os.path.join(CAPTURE, "%d.argv" % n), "w", encoding="utf-8") as fh:
+        json.dump(argv, fh)
+    with open(os.path.join(CAPTURE, "%d.url" % n), "w", encoding="utf-8") as fh:
+        fh.write(url or "")
+    if payload is not None:
+        with open(os.path.join(CAPTURE, "%d.payload" % n), "w", encoding="utf-8") as fh:
+            fh.write(payload)
+    if header_files:
+        chunks = []
+        mode = None
+        for path in header_files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                    chunks.append(fh.read())
+                mode = os.stat(path).st_mode & 0o777
+            except OSError as exc:
+                sys.stderr.write("fake curl: cannot read header file %s: %s\n" % (path, exc))
+                sys.exit(2)
+        with open(os.path.join(CAPTURE, "%d.headers" % n), "w", encoding="utf-8") as fh:
+            fh.write("".join(chunks))
+        if mode is not None:
+            with open(os.path.join(CAPTURE, "%d.header_mode" % n), "w", encoding="ascii") as fh:
+                fh.write("%o" % mode)
+
+if env("FAKE_CURL_FAIL") == "1":
+    sys.stderr.write("Connection refused (fake)\n")
+    sys.exit(6)
+
+if url is None or body_path is None or headers_path is None:
+    sys.stderr.write("fake curl: expected -o, -D and a URL\n")
+    sys.exit(2)
+
+if url.rstrip("/").endswith("/responses"):
+    code = int(env("FAKE_RESPONSES_CODE", "200"))
+    body = env("FAKE_RESPONSES_BODY")
+    ctype = env("FAKE_RESPONSES_CT", "text/event-stream")
+    error_stream = env("FAKE_RESPONSES_ERROR_STREAM") == "1"
+    truncated = env("FAKE_RESPONSES_TRUNCATED") == "1"
+    is_chat = False
+elif url.rstrip("/").endswith("/chat/completions"):
+    code = int(env("FAKE_CHAT_CODE", "200"))
+    body = env("FAKE_CHAT_BODY")
+    ctype = env("FAKE_CHAT_CT", "text/event-stream")
+    error_stream = env("FAKE_CHAT_ERROR_STREAM") == "1"
+    truncated = env("FAKE_CHAT_TRUNCATED") == "1"
+    is_chat = True
+elif url.rstrip("/").endswith("/models"):
+    code = int(env("FAKE_MODELS_CODE", "200"))
+    body = env("FAKE_MODELS_BODY")
+    ctype = env("FAKE_MODELS_CT", "application/json")
+    error_stream = False
+    truncated = False
+    is_chat = False
+else:
+    sys.stderr.write("fake curl: unexpected URL: %s\n" % url)
+    sys.exit(2)
+
+if not body:
+    if code == 200 and ctype == "text/event-stream":
+        if is_chat:
+            if truncated:
+                body = (
+                    'data: {"id":"c1","object":"chat.completion.chunk",'
+                    '"choices":[{"index":0,"delta":{"content":"OK"}}],"usage":{"total_tokens":3}}\n'
+                    "\n"
+                )
+            elif error_stream:
+                body = (
+                    'data: {"id":"c1","object":"chat.completion.chunk",'
+                    '"choices":[{"index":0,"delta":{}}],"error":{"message":"boom"}}\n'
+                    "\n"
+                    "data: [DONE]\n"
+                    "\n"
+                )
+            else:
+                body = (
+                    'data: {"id":"c1","object":"chat.completion.chunk",'
+                    '"choices":[{"index":0,"delta":{"content":"OK"}}],"usage":{"total_tokens":3}}\n'
+                    "\n"
+                    "data: [DONE]\n"
+                    "\n"
+                )
+        else:
+            if truncated:
+                body = (
+                    "event: response.created\n"
+                    'data: {"type":"response.created","response":{"id":"r1","status":"in_progress"}}\n'
+                    "\n"
+                )
+            elif error_stream:
+                body = (
+                    "event: error\n"
+                    'data: {"type":"error","error":{"code":"server_error"}}\n'
+                    "\n"
+                    "event: response.completed\n"
+                    'data: {"type":"response.completed","response":{"id":"r1","status":"completed"},'
+                    '"usage":{"total_tokens":2}}\n'
+                    "\n"
+                )
+            else:
+                body = (
+                    "event: response.created\n"
+                    'data: {"type":"response.created","response":{"id":"r1","status":"in_progress"}}\n'
+                    "\n"
+                    "event: response.completed\n"
+                    'data: {"type":"response.completed","response":{"id":"r1","status":"completed"},'
+                    '"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}\n'
+                    "\n"
+                )
+    elif code == 200:
+        body = '{"id":"m1","object":"list","data":[{"id":"gpt-5.6-luna","object":"model"}]}'
+    else:
+        body = json.dumps(
+            {
+                "error": {
+                    "message": "upstream_error: rejected (fake)",
+                    "type": "invalid_request_error",
+                    "code": code,
+                }
+            }
+        )
+
+with open(body_path, "w", encoding="utf-8") as fh:
+    fh.write(body)
+with open(headers_path, "w", encoding="ascii") as fh:
+    status_text = "OK" if code == 200 else "Error"
+    fh.write("HTTP/1.1 %d %s\r\nContent-Type: %s\r\n\r\n" % (code, status_text, ctype))
+sys.stdout.write(str(code))
