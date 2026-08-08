@@ -162,6 +162,27 @@ expect_no_text_in_case() {
   done
 }
 
+expect_file_not_contain() {
+  if grep -Fq -- "$1" "$2"; then
+    fail "forbidden fixture text leaked"
+  fi
+}
+
+expect_all_output_lines_under() {
+  python3 - "$CASE_DIR/stdout" "$CASE_DIR/stderr" "$1" <<'PY'
+import sys
+
+paths = sys.argv[1:-1]
+limit = int(sys.argv[-1])
+for path in paths:
+    with open(path, encoding="utf-8") as fh:
+        for number, line in enumerate(fh, 1):
+            length = len(line.rstrip())
+            if length >= limit:
+                raise SystemExit(f"{path}:{number}: line length {length} >= {limit}")
+PY
+}
+
 case_basic_responses() {
   new_case
   write_config <<'YAML'
@@ -447,6 +468,105 @@ YAML
   expect_no_text_in_case 'CHAT_ERROR_ENVELOPE_MARKER'
 }
 
+case_non_200_json_unknown_error_bounded() {
+  local body
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  body=$(python3 - <<'PY'
+import json
+
+marker = "HTTP500_UNKNOWN_OBJECT_MARKER"
+print(json.dumps({
+    "error": {"message": {"marker": marker}},
+    "unknown": {"nested": [marker + ("x" * 3000)]},
+}))
+PY
+  )
+  run_probe "FAKE_RESPONSES_CODE=500" "FAKE_RESPONSES_CT=application/json" \
+    "FAKE_RESPONSES_BODY=$body"
+  expect_status 1
+  expect_stdout '[FAIL] Provider returned error (HTTP 500):'
+  expect_stdout 'unrecognized JSON error response'
+  expect_all_output_lines_under 512
+  expect_no_text_in_case 'HTTP500_UNKNOWN_OBJECT_MARKER'
+  expect_capture_count 1
+}
+
+case_non_200_json_long_error_message_bounded() {
+  local body
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  body=$(python3 - <<'PY'
+import json
+
+print(json.dumps({
+    "error": {
+        "message": "HTTP500_LONG_MESSAGE_PREFIX "
+        + ("x" * 400)
+        + " HTTP500_LONG_MESSAGE_TAIL_MARKER"
+    }
+}))
+PY
+  )
+  run_probe "FAKE_RESPONSES_CODE=500" "FAKE_RESPONSES_CT=application/json" \
+    "FAKE_RESPONSES_BODY=$body"
+  expect_status 1
+  expect_stdout '[FAIL] Provider returned error (HTTP 500):'
+  expect_stdout 'HTTP500_LONG_MESSAGE_PREFIX'
+  expect_stdout '…'
+  expect_all_output_lines_under 512
+  expect_no_text_in_case 'HTTP500_LONG_MESSAGE_TAIL_MARKER'
+  expect_capture_count 1
+}
+
+case_models_non_200_json_unknown_error_bounded() {
+  local body
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  body=$(python3 - <<'PY'
+import json
+
+marker = "MODELS_HTTP500_UNKNOWN_OBJECT_MARKER"
+print(json.dumps({"error": {"message": {"marker": marker + ("x" * 3000)}}}))
+PY
+  )
+  run_probe LIST_MODELS=1 FAKE_MODELS_CODE=500 FAKE_MODELS_CT=application/json \
+    "FAKE_MODELS_BODY=$body"
+  expect_status 0
+  expect_stdout 'Models endpoint: unavailable (HTTP 500)'
+  expect_stdout 'JSON error: unrecognized JSON error response'
+  expect_stdout '[PASS] Provider is available.'
+  expect_all_output_lines_under 512
+  expect_no_text_in_case 'MODELS_HTTP500_UNKNOWN_OBJECT_MARKER'
+  expect_capture_count 2
+  expect_url 1 '/models'
+  expect_url 2 '/responses'
+}
+
 case_explicit_base_url_userinfo_rejected() {
   local marker='URL_USERINFO_SYNTHETIC_SECRET'
   new_case
@@ -561,6 +681,49 @@ YAML
   expect_stderr '[FAIL] Failed to parse'
 }
 
+assert_invalid_base_url() {
+  local base_url="$1" marker="$2"
+  new_case
+  write_config <<YAML
+model:
+  provider: custom:fixture
+  base_url: '$base_url'
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_status 1
+  expect_stderr '[FAIL] Failed to parse'
+  expect_capture_count 0
+  expect_no_text_in_case "$marker"
+}
+
+case_invalid_ipv4_host_rejected() {
+  assert_invalid_base_url \
+    'http://127.0.0.999/v1/INVALID_IPV4_HOST_MARKER' \
+    'INVALID_IPV4_HOST_MARKER'
+}
+
+case_backslash_host_rejected() {
+  assert_invalid_base_url \
+    'http://example.com\bad/v1/BACKSLASH_HOST_MARKER' \
+    'BACKSLASH_HOST_MARKER'
+}
+
+case_invalid_backslash_host_marker_rejected() {
+  assert_invalid_base_url \
+    'http://invalid\MARKER/v1/INVALID_BACKSLASH_HOST_MARKER' \
+    'MARKER'
+}
+
+case_malformed_hostname_label_rejected() {
+  assert_invalid_base_url \
+    'http://bad..example.com/v1/MALFORMED_LABEL_MARKER' \
+    'MALFORMED_LABEL_MARKER'
+}
+
 case_valid_ipv6_trailing_slash_base_url() {
   new_case
   write_config <<'YAML'
@@ -577,6 +740,99 @@ YAML
   expect_stdout '[PASS] Provider is available.'
   expect_capture_count 1
   expect_url 1 'http://[::1]:18081/v1/responses'
+}
+
+case_valid_localhost_trailing_slash_base_url() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://localhost:18081/v1/
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_capture_count 1
+  expect_url 1 'http://localhost:18081/v1/responses'
+}
+
+case_baseurl_camel_alias_precedence() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+custom_providers:
+  - name: fixture
+    baseUrl: http://127.0.0.1:18081/v1
+    url: http://127.0.0.1:19091/v1
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_capture_count 1
+  expect_url 1 'http://127.0.0.1:18081/v1/responses'
+  expect_no_text_in_case 'http://127.0.0.1:19091/v1'
+}
+
+case_custom_registry_precedes_providers() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+custom_providers:
+  - name: fixture
+    base_url: http://127.0.0.1:18081/v1
+    key_env: CUSTOM_FIXTURE_API_KEY
+    extra_headers:
+      X-Hermes-Registry: custom-registry-header
+providers:
+  - name: fixture
+    base_url: http://127.0.0.1:19091/v1
+    key_env: PROVIDER_FIXTURE_API_KEY
+    extra_headers:
+      X-Hermes-Registry: providers-registry-header
+YAML
+  write_env
+  run_probe CUSTOM_FIXTURE_API_KEY=synthetic-custom-key \
+    PROVIDER_FIXTURE_API_KEY=synthetic-providers-key
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_capture_count 1
+  expect_url 1 'http://127.0.0.1:18081/v1/responses'
+  expect_headers_contain 'Authorization: Bearer synthetic-custom-key' 1
+  expect_headers_contain 'X-Hermes-Registry: custom-registry-header' 1
+  expect_no_text_in_case 'providers-registry-header'
+  expect_no_text_in_case 'synthetic-providers-key'
+  expect_file_not_contain 'synthetic-custom-key' "$CASE_DIR/stdout"
+  expect_file_not_contain 'synthetic-custom-key' "$CASE_DIR/stderr"
+  expect_file_not_contain 'synthetic-custom-key' "$CASE_DIR/capture/1.argv"
+}
+
+case_empty_base_url_keeps_camel_alias_ignored() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+custom_providers:
+  - name: fixture
+    base_url: ''
+    baseUrl: http://127.0.0.1:18081/v1
+    url: http://127.0.0.1:19091/v1
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe
+  expect_status 0
+  expect_stdout '[PASS] Provider is available.'
+  expect_capture_count 1
+  expect_url 1 'http://127.0.0.1:19091/v1/responses'
+  expect_no_text_in_case 'http://127.0.0.1:18081/v1'
 }
 
 case_fallback_400_responses_primary() {
@@ -912,13 +1168,24 @@ run_case chat_json_wrong_role_rejected
 run_case chat_json_empty_content_rejected
 run_case chat_json_non_string_content_rejected
 run_case chat_json_error_envelope_rejected
+run_case non_200_json_unknown_error_bounded
+run_case non_200_json_long_error_message_bounded
+run_case models_non_200_json_unknown_error_bounded
 run_case explicit_base_url_userinfo_rejected
 run_case explicit_base_url_empty_userinfo_rejected
 run_case explicit_base_url_percent_encoded_userinfo_rejected
 run_case explicit_base_url_query_rejected
 run_case explicit_base_url_fragment_rejected
 run_case fallback_base_url_userinfo_rejected
+run_case invalid_ipv4_host_rejected
+run_case backslash_host_rejected
+run_case invalid_backslash_host_marker_rejected
+run_case malformed_hostname_label_rejected
 run_case valid_ipv6_trailing_slash_base_url
+run_case valid_localhost_trailing_slash_base_url
+run_case baseurl_camel_alias_precedence
+run_case custom_registry_precedes_providers
+run_case empty_base_url_keeps_camel_alias_ignored
 run_case fallback_400_responses_primary
 run_case fallback_400_chat_primary
 for code in 401 403 429 500 503; do

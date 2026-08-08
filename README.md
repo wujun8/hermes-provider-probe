@@ -62,7 +62,17 @@
   两种写法均支持）中按名称或归一化 URL 匹配条目取回 base_url。
 - `model.base_url` 及回退路由只允许 HTTP(S) origin/path 形式；userinfo（包括
   percent-encoded userinfo）、query、fragment、空白/控制字符，以及无效 host 或
-  port 会在任何输出或 curl 调用前被拒绝。
+  port 会在任何输出或 curl 调用前被拒绝。数值点分主机必须是可由 `ipaddress`
+  解析的有效 IPv4；IPv6 必须是有效的方括号地址；DNS/localhost 名称会经过
+  IDNA 与总长度、label 长度/字符、空 label、首尾连字符校验。这些是主机语法
+  校验，不代表 DNS 可达性；IPv6 zone identifier 不在支持范围内。
+- provider 兼容查找遵循 Hermes 优先级：`custom_providers` 在 `providers` 之前，
+  因此同一 identity/route 的 key、route 与 `extra_headers` 都来自 custom 条目。
+  路由别名规则也与 Hermes 一致：存在 `base_url` 键时完全忽略 `baseUrl`，按
+  `base_url` → `url` → `api` 取第一个非空值；缺少 `base_url` 键时才按
+  `baseUrl` → `url` → `api` 取值。显式 `model.base_url` 仍具有最高优先级。
+- 非 200 JSON 只输出 HTTP 状态与安全、有界的 scalar 错误摘要（detail 最多 300
+  字符并以省略号截断）；不会 dump 完整 JSON body/object/array。
 - 密钥来源优先级：`model.api_key`（支持 `${ENV}` 引用）→ 匹配 provider 条目的
   `key_env` / `api_key` → 兼容环境变量（`CODEX_API_KEY` 等）。找不到密钥时探测失败，
   外部退出码为 1。

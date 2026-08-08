@@ -97,6 +97,7 @@ _CFG_FILE=$(mk_temp "hermes-test-cfg")
 _REQUEST_HEADERS=$(mk_temp "hermes-test-headers")
 chmod 600 "$_CFG_FILE" "$_REQUEST_HEADERS"
 python3 - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
+import ipaddress
 import os
 import re
 import sys
@@ -135,6 +136,53 @@ def invalid_base_url():
     sys.stderr.write("Invalid base URL configuration\n")
     sys.exit(2)
 
+
+def validate_hostname(hostname, authority):
+    # Keep authority parsing strict: encoded authority delimiters and path
+    # separators must never be reinterpreted as part of a host.
+    if any(char in authority for char in ("\\", "/", "%")):
+        invalid_base_url()
+
+    if ":" in hostname:
+        if not authority.startswith("["):
+            invalid_base_url()
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            invalid_base_url()
+        if address.version != 6:
+            invalid_base_url()
+        return
+
+    if "." in hostname and hostname.replace(".", "").isdigit():
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            invalid_base_url()
+        if address.version != 4:
+            invalid_base_url()
+        return
+
+    try:
+        idna_host = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        invalid_base_url()
+    if idna_host.endswith("."):
+        idna_host = idna_host[:-1]
+    if not idna_host or len(idna_host) > 253:
+        invalid_base_url()
+    labels = idna_host.split(".")
+    for label in labels:
+        if (
+            not label
+            or len(label) > 63
+            or not re.fullmatch(r"[A-Za-z0-9-]+", label)
+            or label.startswith("-")
+            or label.endswith("-")
+        ):
+            invalid_base_url()
+
+
 def validate_base_url(value):
     raw = str(value or "")
     if not raw or any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f for char in raw):
@@ -157,6 +205,7 @@ def validate_base_url(value):
         elif ":" in authority:
             if authority.count(":") != 1 or not authority.rsplit(":", 1)[1].isdigit():
                 invalid_base_url()
+        validate_hostname(hostname, authority)
         parsed.port
     except (TypeError, ValueError):
         invalid_base_url()
@@ -225,7 +274,10 @@ def resolve_api_key(value, label):
     return str(value)
 
 def provider_route(entry):
-    for field in ("base_url", "url", "api", "baseUrl"):
+    fields = ("base_url", "url", "api")
+    if "base_url" not in entry:
+        fields = ("baseUrl", "url", "api")
+    for field in fields:
         value = entry.get(field)
         if value:
             return value
@@ -240,7 +292,7 @@ def matching_provider_entry(*, require_credentials=True, require_route=False):
     if ":" in provider:
         provider_names.add(provider.split(":", 1)[1])
     normalized_base = normalize_route(base_url)
-    for raw in (cfg.get("providers"), cfg.get("custom_providers")):
+    for raw in (cfg.get("custom_providers"), cfg.get("providers")):
         for configured_name, entry in named_entries(raw):
             entry_names = {
                 configured_name,
@@ -291,7 +343,7 @@ if not api_key:
     sys.stderr.write("API key not found in configured sources\n")
     sys.exit(2)
 
-compatible_entries = entries(cfg.get("providers")) + entries(cfg.get("custom_providers"))
+compatible_entries = entries(cfg.get("custom_providers")) + entries(cfg.get("providers"))
 
 # Case-insensitive merge: auth first, model.default_headers next, matching
 # provider extra_headers last (the most specific level wins, as in Hermes).
@@ -385,6 +437,64 @@ raise SystemExit(0 if media_type == "text/event-stream" else 1)
 PY
 }
 
+json_error_detail() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+import unicodedata
+
+body_path = sys.argv[1]
+try:
+    with open(body_path, encoding="utf-8") as fh:
+        payload = json.load(fh)
+except (OSError, UnicodeError, ValueError):
+    print("empty JSON error response")
+    raise SystemExit(0)
+
+
+def scalar_detail(value):
+    if value is None or isinstance(value, (dict, list)):
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    return None
+
+
+def normalize_detail(value):
+    text = scalar_detail(value)
+    if text is None:
+        return None
+    text = "".join(
+        " " if unicodedata.category(char).startswith("C") else char
+        for char in text
+    )
+    text = " ".join(text.split())
+    if not text:
+        return None
+    if len(text) > 300:
+        return text[:299] + "…"
+    return text
+
+
+detail = None
+if isinstance(payload, dict):
+    error = payload.get("error")
+    if isinstance(error, dict):
+        detail = normalize_detail(error.get("message"))
+        if detail is None:
+            detail = normalize_detail(payload.get("message"))
+        if detail is None:
+            detail = normalize_detail(error.get("code"))
+        if detail is None:
+            detail = normalize_detail(error.get("type"))
+    else:
+        detail = normalize_detail(payload.get("message"))
+if detail is None:
+    detail = "unrecognized JSON error response"
+print(detail)
+PY
+}
+
 diagnose_non_json() {
   local prefix="$1" http_code="$2" headers_file="$3" body_file="$4"
   python3 - "$prefix" "$http_code" "$headers_file" "$body_file" <<'PY'
@@ -456,7 +566,7 @@ if [[ "$LIST_MODELS" == "1" ]]; then
     jq -r '.data[].id' "$_MODELS_FILE" | sed 's/^/  - /'
   else
     echo "Models endpoint: unavailable (HTTP ${MODELS_HTTP}) [LIST_MODELS=1]"
-    jq -r '(.error.message // .error // .message // "API returned unexpected JSON") | tostring' "$_MODELS_FILE" 2>/dev/null | cut -c1-300 | sed 's/^/  /'
+    printf '  JSON error: %s\n' "$(json_error_detail "$_MODELS_FILE")"
   fi
   echo
 else
@@ -511,7 +621,6 @@ api_request() {
     http_code="000"
   fi
 
-  RESPONSE_BODY=$(cat "$RESPONSE_FILE" 2>/dev/null || true)
   RESPONSE_CURL_ERR=$(cat "$curl_err_file" 2>/dev/null || true)
   ENDPOINT_USED="$endpoint"
   RESPONSE_HTTP="$http_code"
@@ -534,7 +643,6 @@ require_response_body() {
   exit 1
 }
 
-RESPONSE_BODY=""
 RESPONSE_HTTP=""
 ENDPOINT_USED=""
 RESPONSE_CURL_ERR=""
@@ -842,13 +950,8 @@ if [[ -n "$RESPONSE_CURL_ERR" ]]; then
 fi
 
 if [[ "$RESPONSE_HTTP" != "200" ]]; then
-  ERR_MSG=$(echo "$RESPONSE_BODY" | jq -r '
-    if .error.message then .error.message
-    elif .error then (.error | tostring)
-    elif .message then .message
-    else empty end' 2>/dev/null || true)
-  [[ -z "$ERR_MSG" || "$ERR_MSG" == "null" ]] && ERR_MSG="${RESPONSE_BODY:-empty response}"
-  echo "[FAIL] Provider returned error (HTTP ${RESPONSE_HTTP}): ${ERR_MSG}"
+  ERR_MSG=$(json_error_detail "$RESPONSE_FILE")
+  printf '[FAIL] Provider returned error (HTTP %s): %s\n' "$RESPONSE_HTTP" "$ERR_MSG"
   exit 1
 fi
 
