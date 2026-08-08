@@ -483,7 +483,7 @@ echo "Reasoning effort: ${REASONING_EFFORT}"
 # Token policy differs per endpoint: /responses omits max_output_tokens
 # (provider default limit), /chat/completions uses max_tokens: 1.
 if [[ "$PRIMARY_ENDPOINT" == "responses" ]]; then
-  echo 'Prompt: Reply OK. | max output tokens: provider default | stream: true'
+  echo 'Prompt: Reply OK. | instructions: Reply with OK only. | max output tokens: provider default | stream: true'
 else
   echo 'Prompt: Reply OK. | max_tokens: 1 | stream: true'
 fi
@@ -783,6 +783,8 @@ else:
     message = choice.get("message")
     if not isinstance(message, dict):
         fail("first choice has no message object")
+    if message.get("role") != "assistant":
+        fail("first choice message role is not assistant")
     content = message.get("content")
     if not isinstance(content, str) or not content:
         fail("assistant message content is empty or not a string")
@@ -803,7 +805,7 @@ try_responses() {
   # gpt-5.6-luna and gpt-5.6-sol). Omit the field entirely so the provider
   # default output-token limit applies. /chat/completions keeps max_tokens: 1.
   payload=$(jq -nc --arg model "$SELECTED_MODEL" --arg effort "$REASONING_EFFORT" \
-    '{model: $model, input: "Reply OK.", store: false, stream: true, reasoning: {effort: $effort}}')
+    '{model: $model, instructions: "Reply with OK only.", input: "Reply OK.", store: false, stream: true, reasoning: {effort: $effort}}')
   api_request "/responses" "$payload"
 }
 

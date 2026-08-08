@@ -182,6 +182,7 @@ YAML
   # Fix: the prompt must state per-endpoint token policy, never a blanket
   # "max output tokens: 1" (which is wrong for /responses).
   expect_stdout 'max output tokens: provider default'
+  expect_stdout 'Prompt: Reply OK. | instructions: Reply with OK only. | max output tokens: provider default | stream: true'
   expect_no_stdout 'max output tokens: 1'
   expect_no_stdout 'incompatible'
   expect_quiet_stderr
@@ -191,6 +192,7 @@ YAML
   expect_payload_true 1 'has("max_output_tokens") | not'
   expect_payload_field 1 '.model' 'gpt-5.6-luna'
   expect_payload_field 1 '.input' 'Reply OK.'
+  expect_payload_field 1 '.instructions' 'Reply with OK only.'
   expect_payload_field 1 '.stream' 'true'
   expect_payload_field 1 '.store' 'false'
   expect_payload_field 1 '.reasoning.effort' 'none'
@@ -365,6 +367,26 @@ YAML
   expect_stdout 'Tokens used: 1'
   expect_quiet_stderr
   expect_capture_count 1
+}
+
+case_chat_json_wrong_role_rejected() {
+  new_case
+  write_config <<'YAML'
+model:
+  provider: custom:fixture
+  base_url: http://127.0.0.1:18081/v1
+  api_mode: chat_completions
+custom_providers:
+  - name: fixture
+    key_env: FIXTURE_API_KEY
+YAML
+  write_env
+  run_probe FAKE_CHAT_CT=application/json \
+    FAKE_CHAT_BODY='{"choices":[{"message":{"role":"user","content":"CHAT_WRONG_ROLE_MARKER"}}]}'
+  expect_status 1
+  expect_stdout '[FAIL] Unexpected /chat/completions JSON response'
+  expect_capture_count 1
+  expect_no_text_in_case 'CHAT_WRONG_ROLE_MARKER'
 }
 
 case_chat_json_empty_content_rejected() {
@@ -886,6 +908,7 @@ run_case responses_json_non_array_output_rejected
 run_case chat_json_choices_string_rejected
 run_case chat_json_empty_choices_rejected
 run_case chat_json_valid_message
+run_case chat_json_wrong_role_rejected
 run_case chat_json_empty_content_rejected
 run_case chat_json_non_string_content_rejected
 run_case chat_json_error_envelope_rejected
