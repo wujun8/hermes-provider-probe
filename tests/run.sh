@@ -44,9 +44,14 @@ write_env() {
   printf '%s\n' 'FIXTURE_API_KEY=synthetic-red-key' >"$CASE_DIR/hermes/.env"
 }
 
+# Terminate the current case subshell immediately. A plain `return 1` is
+# unreliable here: assertions run as `cmd || fail`, and when such a failure
+# is the last command of a function, bash >= 4.4/5.x suppresses errexit at
+# the call site, silently swallowing the failed assertion. `exit 1` makes
+# the failure deterministic on every bash version (macOS 3.2 and CI 5.x).
 fail() {
   echo "assertion failed: $*" >&2
-  return 1
+  exit 1
 }
 
 # Run the probe with a clean environment. Extra arguments are NAME=VALUE
@@ -115,13 +120,16 @@ expect_payload_field() {
   [[ "$actual" == "$3" ]] || fail "capture $1 payload $2: expected '$3', got '$actual'"
 }
 
+# Diagnostics must never echo the asserted pattern (it contains the
+# synthetic key). Messages stay generic; the case name identifies the check.
 expect_headers_contain() {
-  grep -Fq -- "$1" "$CASE_DIR/capture/$2.headers" || fail "capture $2 headers missing: $1"
+  grep -Fq -- "$1" "$CASE_DIR/capture/$2.headers" \
+    || fail "capture $2 headers: expected content not found"
 }
 
 expect_headers_not_contain() {
   if grep -Fq -- "$1" "$CASE_DIR/capture/$2.headers"; then
-    fail "capture $2 headers must not contain: $1"
+    fail "capture $2 headers: unexpected content present"
   fi
 }
 

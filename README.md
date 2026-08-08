@@ -1,8 +1,13 @@
 # hermes-provider-probe
 
-对 Hermes 主 LLM provider 的最小化可用性探测脚本：以极小 token 消耗（提示词仅
-`Reply OK.`）验证配置的 provider/model 是否真正可用，并输出所用 endpoint、
-HTTP 状态与 token 用量。用于在依赖方暴露连接故障之前，快速定位配置或上游问题。
+对 Hermes 主 LLM provider 的最小化可用性探测脚本：提示词仅 `Reply OK.` 三个词，
+验证配置的 provider/model 是否真正可用，并输出所用 endpoint、HTTP 状态与 token
+用量。用于在依赖方暴露连接故障之前，快速定位配置或上游问题。
+
+> 关于 token 消耗：`/responses` 刻意不设置硬性输出上限（省略
+> `max_output_tokens`，使用 provider default），因此单次探测的实际输出 token
+> 数由 provider 决定，脚本不做承诺；通常消耗较低主要来自极短提示词与
+> `reasoning.effort=none`，而非硬限制。
 
 ## 特性
 
@@ -22,7 +27,7 @@ HTTP 状态与 token 用量。用于在依赖方暴露连接故障之前，快�
 
 ## 依赖
 
-- bash 4+
+- bash 3.2+（macOS 自带 /bin/bash 3.2 已验证可运行；较新 bash 亦可）
 - curl
 - jq
 - python3 + PyYAML（`python3 -c 'import yaml'` 可验证）
