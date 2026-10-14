@@ -3,9 +3,17 @@
 # Default provider health check uses gpt-5.6-luna with reasoning.effort=none (override with TEST_MODEL). /v1/models is off by default.
 set -euo pipefail
 
-HERMES_DIR="${HERMES_DIR:-${HOME}/.hermes}"
+# Prefer explicit HERMES_DIR / HERMES_HOME (Docker sets these) over HOME/.hermes —
+# container HOME is often a profile sandbox that does not contain config.yaml.
+HERMES_DIR="${HERMES_DIR:-${HERMES_HOME:-${HOME}/.hermes}}"
 CONFIG_FILE="${HERMES_DIR}/config.yaml"
 ENV_FILE="${HERMES_DIR}/.env"
+# The CLI supplies its interpreter; direct execution can select one explicitly.
+if [[ -n "${HERMES_PYTHON:-}" ]]; then
+  _PROBE_PYTHON=("$HERMES_PYTHON")
+else
+  _PROBE_PYTHON=("$(command -v python3 || true)")
+fi
 CURL_TIMEOUT="${CURL_TIMEOUT:-30}"
 # Set LIST_MODELS=1 to call /v1/models (informational only; does not change the test model).
 LIST_MODELS="${LIST_MODELS:-0}"
@@ -85,7 +93,7 @@ should_fallback_endpoint() {
 
 need_cmd curl
 need_cmd jq
-need_cmd python3
+[[ -n "${_PROBE_PYTHON[0]}" && -x "${_PROBE_PYTHON[0]}" ]] || die "Required Python interpreter not found: ${HERMES_PYTHON:-python3}"
 
 [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
 
@@ -96,18 +104,14 @@ load_env_file "$ENV_FILE" "$(compgen -A variable)"
 _CFG_FILE=$(mk_temp "hermes-test-cfg")
 _REQUEST_HEADERS=$(mk_temp "hermes-test-headers")
 chmod 600 "$_CFG_FILE" "$_REQUEST_HEADERS"
-python3 - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
+"${_PROBE_PYTHON[@]}" - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
 import ipaddress
 import os
 import re
 import sys
 from urllib.parse import unquote, urlsplit, urlunsplit
 
-try:
-    import yaml
-except ImportError:
-    sys.stderr.write("PyYAML is required (pip install pyyaml)\n")
-    sys.exit(1)
+import yaml
 
 config_path, headers_path = sys.argv[1:]
 with open(config_path, encoding="utf-8") as fh:
@@ -411,7 +415,7 @@ is_json_file() {
 }
 
 response_content_type_is_sse() {
-  python3 - "$1" <<'PY'
+  "${_PROBE_PYTHON[@]}" - "$1" <<'PY'
 import re
 import sys
 
@@ -438,7 +442,7 @@ PY
 }
 
 json_error_detail() {
-  python3 - "$1" <<'PY'
+  "${_PROBE_PYTHON[@]}" - "$1" <<'PY'
 import json
 import sys
 import unicodedata
@@ -497,7 +501,7 @@ PY
 
 diagnose_non_json() {
   local prefix="$1" http_code="$2" headers_file="$3" body_file="$4"
-  python3 - "$prefix" "$http_code" "$headers_file" "$body_file" <<'PY'
+  "${_PROBE_PYTHON[@]}" - "$prefix" "$http_code" "$headers_file" "$body_file" <<'PY'
 import re
 import sys
 prefix, status, headers_path, body_path = sys.argv[1:]
@@ -651,7 +655,7 @@ RESPONSE_HEADERS_FILE=""
 
 validate_sse_response() {
   local endpoint="$1" body_file="$2" result
-  if result=$(python3 - "$endpoint" "$body_file" <<'PY'
+  if result=$("${_PROBE_PYTHON[@]}" - "$endpoint" "$body_file" <<'PY'
 import json
 import re
 import sys
@@ -771,6 +775,10 @@ for raw_line in body.splitlines(keepends=True):
 dispatch()
 
 if endpoint == "/responses":
+    # Some compatible relays append [DONE] after response.completed.
+    # Keep the completed/status/error checks below authoritative.
+    if records and records[-1] == "[DONE]":
+        records = records[:-1]
     for record in records:
         if record == "[DONE]":
             fail("Responses SSE contains an unexpected [DONE]")
@@ -838,7 +846,7 @@ PY
 
 validate_json_response() {
   local endpoint="$1" body_file="$2" result
-  if result=$(python3 - "$endpoint" "$body_file" <<'PY'
+  if result=$("${_PROBE_PYTHON[@]}" - "$endpoint" "$body_file" <<'PY'
 import json
 import sys
 

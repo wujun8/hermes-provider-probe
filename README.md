@@ -1,123 +1,110 @@
-# hermes-provider-probe
+# Hermes provider probe
 
-对 Hermes 主 LLM provider 的最小化可用性探测脚本：提示词仅使用简短的 `Reply OK.`，
-验证配置的 provider/model 是否真正可用，并输出所用 endpoint、HTTP 状态与 token
-用量。用于在依赖方暴露连接故障之前，快速定位配置或上游问题。
-
-> 关于 token 消耗：`/responses` 发送显式的短 `instructions: "Reply with OK only."`，
-> 用来避免 provider 注入或默认附加的长 instruction 前缀；同时保留
-> `input: "Reply OK."`。脚本刻意不设置硬性输出上限（省略
-> `max_output_tokens`，使用 provider default），provider usage 仍可能变化，
-> 脚本不承诺固定的总 token 成本；通常消耗较低主要来自短提示词、短 instructions
-> 与 `reasoning.effort=none`，而非硬限制。
-
-## 特性
-
-- 默认健康检查模型 `gpt-5.6-luna`，`reasoning.effort=none`（最小开销），可用
-  `TEST_MODEL` 覆盖。
-- 默认走 `codex_responses`（`/responses`）；显式配置 `api_mode: chat_completions`
-  时走 `/chat/completions`。
-- Token 策略按 endpoint 区分：
-  - `/responses` 发送短 `instructions: "Reply with OK only."`，以避免 provider
-    注入或默认附加的长 instruction 前缀；载荷**完全省略** `max_output_tokens`——
-    上游对该字段（即使值为 1）返回 HTTP 400 `upstream_error`，省略后使用
-    provider default 输出上限。provider usage 仍可能变化，不能据此保证固定总 token 成本。
-  - `/chat/completions` 保留 `max_tokens: 1`。
-- 主 endpoint 返回 HTTP 400 时自动改试另一 endpoint（401/403/429/5xx 与 HTML
-  响应一律不重试）；文案中性，仅报告 `returned HTTP 400`。
-- 密钥只写入权限 0600 的 header 文件，不进入 curl 参数，也不打印到终端。
-- 任何异常 shape（curl 失败、非 JSON、SSE 截断/错误事件、非 200）一律
-  fail-closed 并以非零退出码结束，绝不误报成功。
-
-## 依赖
-
-- bash 3.2+（macOS 自带 /bin/bash 3.2 已验证可运行；较新 bash 亦可）
-- curl
-- jq
-- python3 + PyYAML（`python3 -c 'import yaml'` 可验证）
-
-## 用法
+This standalone plugin adds:
 
 ```sh
-./test-provider.sh
+hermes provider-probe [--home HOME] [--model MODEL] [--timeout SECONDS] [--list-models]
 ```
 
-默认读取 `~/.hermes/config.yaml` 与 `~/.hermes/.env`（.env 只解析 `KEY=VALUE`
-行，不执行任何 shell 代码，且不会覆盖环境中已存在的同名变量）。
+It uses the public `ctx.register_cli_command` interface supported by Hermes
+v0.21.6. Keep this directory outside the Hermes core checkout; on this machine
+its source is `/Users/herelink/.hermes/extensions/hermes-provider-probe/`.
+Installing it places the plugin in the selected Hermes home's
+`plugins/provider-probe/` directory, which survives core upgrades.
 
-### 环境变量
+The command reads the current profile at invocation time through
+`hermes_constants.get_hermes_home()`. `--home` chooses a different profile to
+probe. `--model` overrides the health-check model (normally `gpt-5.6-luna`),
+`--timeout` sets curl's timeout for each request (normally 30 seconds), and
+`--list-models` enables an informational `/models` request. Model listing
+failures do not determine the health result.
 
-| 变量 | 作用 | 默认 |
-| --- | --- | --- |
-| `HERMES_DIR` | 存放 config.yaml / .env 的目录 | `$HOME/.hermes` |
-| `TEST_MODEL` | 覆盖被测模型 | `gpt-5.6-luna` |
-| `CURL_TIMEOUT` | curl 超时秒数 | `30` |
-| `LIST_MODELS` | 设为 `1` 时额外调用 `/models` 列出模型（仅信息性，不影响测试模型） | `0` |
+## Requirements and temporary-home installation
 
-### 配置要点（config.yaml）
+The probe requires Bash, curl, jq, and Python 3 with `PyYAML>=6,<7`.
+The manifest declares the bounded Python dependency for Hermes PM. The CLI
+always supplies `sys.executable` as the probe's `HERMES_PYTHON`, so config
+loading and response validation use the same interpreter.
 
-- 读取 `model.provider` / `model.base_url` / `model.api_mode` / `model.default`。
-- `model.api_mode` 缺省为 `codex_responses`；显式配置优先于默认值。
-- `model.base_url` 缺失时，从 `providers` / `custom_providers`（list 与 dict
-  两种写法均支持）中按名称或归一化 URL 匹配条目取回 base_url。
-- `model.base_url` 及回退路由只允许 HTTP(S) origin/path 形式；userinfo（包括
-  percent-encoded userinfo）、query、fragment、空白/控制字符，以及无效 host 或
-  port 会在任何输出或 curl 调用前被拒绝。数值点分主机必须是可由 `ipaddress`
-  解析的有效 IPv4；IPv6 必须是有效的方括号地址；DNS/localhost 名称会经过
-  IDNA 与总长度、label 长度/字符、空 label、首尾连字符校验。这些是主机语法
-  校验，不代表 DNS 可达性；IPv6 zone identifier 不在支持范围内。
-- provider 兼容查找遵循 Hermes 优先级：`custom_providers` 在 `providers` 之前，
-  因此同一 identity/route 的 key、route 与 `extra_headers` 都来自 custom 条目。
-  路由别名规则也与 Hermes 一致：存在 `base_url` 键时完全忽略 `baseUrl`，按
-  `base_url` → `url` → `api` 取第一个非空值；缺少 `base_url` 键时才按
-  `baseUrl` → `url` → `api` 取值。显式 `model.base_url` 仍具有最高优先级。
-- 非 200 JSON 只输出 HTTP 状态与安全、有界的 scalar 错误摘要（detail 最多 300
-  字符并以省略号截断）；不会 dump 完整 JSON body/object/array。
-- 密钥来源优先级：`model.api_key`（支持 `${ENV}` 引用）→ 匹配 provider 条目的
-  `key_env` / `api_key` → 兼容环境变量（`CODEX_API_KEY` 等）。找不到密钥时探测失败，
-  外部退出码为 1。
-- 输出提示词按 endpoint 准确说明 token 策略：Responses 显示短 instructions 并使用
-  provider default（不承诺固定 usage），Chat 使用 `max_tokens: 1`。
-
-## 测试
+To try discovery without changing an existing profile, copy the plugin into a
+new temporary Hermes home and enable it there:
 
 ```sh
-bash tests/run.sh
+probe_source=/Users/herelink/.hermes/extensions/hermes-provider-probe
+probe_test_home=$(mktemp -d)
+mkdir -p "$probe_test_home/plugins/provider-probe"
+cp "$probe_source/plugin.yaml" "$probe_source/__init__.py" \
+   "$probe_source/test-provider.sh" "$probe_test_home/plugins/provider-probe/"
+HERMES_HOME="$probe_test_home" hermes plugins enable provider-probe
+HERMES_HOME="$probe_test_home" hermes provider-probe --help
 ```
 
-全量 hermetic 测试：无外网（curl 替换为 `tests/fake-curl`）、临时 HERMES_DIR、
-synthetic key、覆盖以下场景：
+Enablement uses the normal Hermes dependency admission process. To run a real
+probe, give that temporary home's `config.yaml` a model/provider route and
+credential reference, and provide the key in that home's `.env` or the caller's
+environment. For example:
 
-- `custom_providers` / `providers` 的 list / dict route fallback
-- 显式 `model.base_url` 优先于 provider 条目路由
-- 完全缺地址时 fail-closed 且不调用 curl
-- 密钥不出现在 stdout / stderr / curl argv，仅存在于 0600 的 header 文件
-- 默认与显式的 model / api_mode（Responses 与 Chat 的 SSE 成功流）
-- 关键截断与失败流（SSE 截断、error 事件）fail-closed
-- 严格校验非 SSE JSON shape：Responses 的 `status` / `output`，以及 Chat 的
-  `choices` / assistant `message.content`
-- 仅 JSON HTTP 400 触发 fallback；401/403/429/5xx 与 HTML 不 fallback
-- base_url 凭据安全回归：拒绝 userinfo、percent-encoded userinfo、query 与
-  fragment，且 marker 不出现在输出或 curl capture 中
-- noisy 环境变量不影响行为与密钥选择
-- 回归：`/responses` 载荷不含 `max_output_tokens`；`/chat/completions` 载荷
-  保留 `max_tokens: 1`；HTTP 400 文案中性
+```yaml
+model:
+  provider: custom
+  base_url: https://your-provider.example/v1
+  default: your-conversation-model
+  api_mode: codex_responses
+  api_key: ${PROBE_API_KEY}
+plugins:
+  enabled: [provider-probe]
+```
 
-## CI
+The shell script also runs independently, with no core checkout on its Python
+path:
 
-`.github/workflows/test.yml`：ubuntu-latest，`permissions: contents: read`，
-安装 jq / shellcheck / python3-yaml 后依次执行 `bash -n`、`shellcheck`、
-`bash tests/run.sh`，与上文命令一致。
+```sh
+HERMES_HOME=/path/to/profile HERMES_PYTHON=/path/to/python \
+  bash /path/to/hermes-provider-probe/test-provider.sh
+```
 
-## 安全边界
+If `HERMES_PYTHON` is unset, direct execution uses `command -v python3`.
+Existing script controls remain available: `HERMES_DIR` selects the profile
+before `HERMES_HOME`, `TEST_MODEL` overrides the model, `CURL_TIMEOUT` sets the
+request timeout, and `LIST_MODELS=1` enables model listing. CLI options override
+their corresponding script controls; the CLI always resolves the profile from
+`--home` or the current Hermes profile.
 
-- 测试全部使用 synthetic key 与临时目录，不触碰真实凭据。
-- 脚本不执行 `.env` 中的任意代码；密钥经 `-H @file` 传入 curl，不进入 argv。
-- 探测失败（非 200、非 JSON、SSE 异常、curl 错误）一律非零退出。
+## Health and credential behavior
 
-## 退出码
+Exit status 0 means the complete response passed validation; failures exit 1.
+The probe accepts a Responses stream ending in a successful
+`response.completed`, optionally followed by one `[DONE]`. An early/repeated
+`[DONE]`, an error event, `response.failed`, `response.incomplete`, a missing
+completion, or a non-completed terminal status fails. Chat streams require a
+choices-bearing chunk and a final `[DONE]`. Valid non-streaming JSON responses
+remain supported. Only an HTTP 400 permits retrying the alternate endpoint;
+401/403/429/5xx and incomplete streams fail without fallback.
 
-| 退出码 | 含义 |
-| --- | --- |
-| `0` | 探测成功（`[PASS]`） |
-| `1` | 所有探测失败：配置/解析、密钥/header、curl、HTTP 非 200、响应 shape 异常等 |
+`.env` values are parsed without executing shell code. Request credentials go
+into a temporary mode-0600 header file, never literal curl arguments or probe
+output, and the temporary directory is removed when the probe exits.
+A successful small health request does not guarantee that a larger conversation
+request will succeed.
+
+The existing production recovery probe at
+`/Users/herelink/app/test-provider.sh` and
+`agent.api_outage_recovery.probe_command` are not changed automatically by
+installing or testing this plugin.
+
+## Verification
+
+Run from an official Hermes checkout with a separate test interpreter that
+includes the declared PyYAML dependency:
+
+```sh
+HERMES_PYTHON=/path/to/test-python bash scripts/run_tests.sh \
+  /absolute/path/to/hermes-provider-probe/tests/test_provider_health.py -j 1
+bash -n /absolute/path/to/hermes-provider-probe/test-provider.sh
+```
+
+The tests use temporary homes and real local HTTP servers. They cover the nine
+Responses SSE regression cases, both endpoint directions' 400-only fallback,
+credential handling, real plugin discovery, the actual CLI parser, subprocess
+probe execution, option forwarding, exit codes, and profile resolution after
+registration. They do not contact production providers.

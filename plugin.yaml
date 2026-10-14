@@ -1,0 +1,5 @@
+name: provider-probe
+version: 0.1.0
+description: Minimal-token availability check for the active Hermes LLM provider
+python_dependencies:
+  - "PyYAML>=6,<7"
