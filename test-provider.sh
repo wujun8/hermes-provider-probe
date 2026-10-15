@@ -3,11 +3,26 @@
 # Default provider health check uses gpt-5.6-luna with reasoning.effort=none (override with TEST_MODEL). /v1/models is off by default.
 set -euo pipefail
 
+ACTIVE_ROUTE_STDIN=0
+if (($#)); then
+  if [[ $# != 1 || "$1" != "--active-route-stdin" ]]; then
+    echo "[FAIL] Unsupported test-provider.sh argument" >&2
+    exit 2
+  fi
+  ACTIVE_ROUTE_STDIN=1
+fi
+
 # Prefer explicit HERMES_DIR / HERMES_HOME (Docker sets these) over HOME/.hermes —
 # container HOME is often a profile sandbox that does not contain config.yaml.
-HERMES_DIR="${HERMES_DIR:-${HERMES_HOME:-${HOME}/.hermes}}"
-CONFIG_FILE="${HERMES_DIR}/config.yaml"
-ENV_FILE="${HERMES_DIR}/.env"
+if (( ACTIVE_ROUTE_STDIN )); then
+  HERMES_DIR=""
+  CONFIG_FILE=""
+  ENV_FILE=""
+else
+  HERMES_DIR="${HERMES_DIR:-${HERMES_HOME:-${HOME}/.hermes}}"
+  CONFIG_FILE="${HERMES_DIR}/config.yaml"
+  ENV_FILE="${HERMES_DIR}/.env"
+fi
 # The CLI supplies its interpreter; direct execution can select one explicitly.
 if [[ -n "${HERMES_PYTHON:-}" ]]; then
   _PROBE_PYTHON=("$HERMES_PYTHON")
@@ -20,6 +35,11 @@ LIST_MODELS="${LIST_MODELS:-0}"
 PROVIDER_HEALTH_MODEL="gpt-5.6-luna"
 REASONING_EFFORT="none"
 # TEST_MODEL may be set via env or later via .env; when unset, the provider health default is used.
+if (( ACTIVE_ROUTE_STDIN )); then
+  # An active route is a single resolved snapshot; profile files and ambient
+  # model-list settings must not influence it.
+  LIST_MODELS=0
+fi
 
 _TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/hermes-test.XXXXXX")
 # shellcheck disable=SC2317,SC2329
@@ -95,16 +115,209 @@ need_cmd curl
 need_cmd jq
 [[ -n "${_PROBE_PYTHON[0]}" && -x "${_PROBE_PYTHON[0]}" ]] || die "Required Python interpreter not found: ${HERMES_PYTHON:-python3}"
 
-[[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
-
-load_env_file "$ENV_FILE" "$(compgen -A variable)"
+if (( ! ACTIVE_ROUTE_STDIN )); then
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+  load_env_file "$ENV_FILE" "$(compgen -A variable)"
+fi
 
 # Parse model/provider settings and build a mode-0600 curl header file.
 # Secrets stay in this file and are never passed as literal curl arguments.
 _CFG_FILE=$(mk_temp "hermes-test-cfg")
 _REQUEST_HEADERS=$(mk_temp "hermes-test-headers")
-chmod 600 "$_CFG_FILE" "$_REQUEST_HEADERS"
-"${_PROBE_PYTHON[@]}" - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
+_ACTIVE_BODY_FILE=$(mk_temp "hermes-test-active-body")
+_ACTIVE_QUERY_FILE=$(mk_temp "hermes-test-active-query")
+chmod 600 "$_CFG_FILE" "$_REQUEST_HEADERS" "$_ACTIVE_BODY_FILE" "$_ACTIVE_QUERY_FILE"
+ACTIVE_QUERY=""
+if (( ACTIVE_ROUTE_STDIN )); then
+  _ACTIVE_ROUTE_FILE=$(mk_temp "hermes-test-active-route")
+  chmod 600 "$_ACTIVE_ROUTE_FILE"
+  cat >"$_ACTIVE_ROUTE_FILE" || die "Failed to read active route input"
+  "${_PROBE_PYTHON[@]}" - "$_ACTIVE_ROUTE_FILE" "$_CFG_FILE" "$_REQUEST_HEADERS" \
+    "$_ACTIVE_BODY_FILE" "$_ACTIVE_QUERY_FILE" >"$_TMP_DIR/active-route-parse.out" 2>/dev/null <<'PY' \
+    || die "Invalid active route input"
+import ipaddress
+import json
+import math
+import re
+import sys
+from urllib.parse import unquote, urlencode, urlsplit
+
+route_path, config_path, headers_path, body_path, query_path = sys.argv[1:]
+
+def fail():
+    raise SystemExit(2)
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            fail()
+        result[key] = value
+    return result
+
+try:
+    with open(route_path, encoding="utf-8") as fh:
+        route = json.load(fh, object_pairs_hook=unique_object)
+except (OSError, UnicodeError, ValueError):
+    fail()
+
+if type(route) is not dict or set(route) - {"model", "request_overrides"}:
+    fail()
+model = route.get("model")
+overrides = route.get("request_overrides", {})
+if type(model) is not dict or type(overrides) is not dict:
+    fail()
+if set(model) - {"provider", "default", "base_url", "api_mode", "api_key", "default_headers"}:
+    fail()
+if set(overrides) - {"extra_body", "extra_headers", "extra_query"}:
+    fail()
+
+provider = model.get("provider")
+default_model = model.get("default")
+base_url = model.get("base_url")
+api_mode = model.get("api_mode")
+api_key = model.get("api_key")
+if not all(isinstance(value, str) and value for value in
+           (provider, default_model, base_url, api_mode, api_key)):
+    fail()
+if not api_key.strip():
+    fail()
+if api_mode not in {"chat_completions", "codex_responses"}:
+    fail()
+if any(any(ord(char) < 0x20 or ord(char) == 0x7f for char in value)
+       for value in (provider, default_model, api_mode)):
+    fail()
+
+default_headers = model.get("default_headers", {})
+extra_body = overrides.get("extra_body", {})
+extra_headers = overrides.get("extra_headers", {})
+extra_query = overrides.get("extra_query", {})
+if (type(default_headers) is not dict or type(extra_body) is not dict
+        or type(extra_headers) is not dict or type(extra_query) is not dict):
+    fail()
+
+def invalid_base_url():
+    fail()
+
+def validate_hostname(hostname, authority):
+    if any(char in authority for char in ("\\", "/", "%")):
+        invalid_base_url()
+    if ":" in hostname:
+        if not authority.startswith("["):
+            invalid_base_url()
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            invalid_base_url()
+        if address.version != 6:
+            invalid_base_url()
+        return
+    if "." in hostname and hostname.replace(".", "").isdigit():
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            invalid_base_url()
+        if address.version != 4:
+            invalid_base_url()
+        return
+    try:
+        idna_host = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        invalid_base_url()
+    if idna_host.endswith("."):
+        idna_host = idna_host[:-1]
+    if not idna_host or len(idna_host) > 253:
+        invalid_base_url()
+    for label in idna_host.split("."):
+        if (not label or len(label) > 63
+                or not re.fullmatch(r"[A-Za-z0-9-]+", label)
+                or label.startswith("-") or label.endswith("-")):
+            invalid_base_url()
+
+def validate_base_url(value):
+    if (not value or any(char.isspace() or ord(char) < 0x20 or ord(char) == 0x7f
+                         for char in value) or "?" in value or "#" in value):
+        invalid_base_url()
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        if parsed.scheme.lower() not in {"http", "https"} or not hostname:
+            invalid_base_url()
+        authority = parsed.netloc
+        if "@" in authority or "@" in unquote(authority):
+            invalid_base_url()
+        if authority.startswith("["):
+            closing = authority.find("]")
+            suffix = authority[closing + 1:]
+            if suffix == ":" or (suffix and (not suffix.startswith(":") or not suffix[1:].isdigit())):
+                invalid_base_url()
+        elif ":" in authority:
+            if authority.count(":") != 1 or not authority.rsplit(":", 1)[1].isdigit():
+                invalid_base_url()
+        validate_hostname(hostname, authority)
+        parsed.port
+    except (TypeError, ValueError):
+        invalid_base_url()
+    return value
+
+base_url = validate_base_url(base_url).rstrip("/")
+headers = {}
+def put(name, value):
+    if not isinstance(name, str) or not name or any(char in name for char in ("\r", "\n", ":")):
+        fail()
+    if value is None:
+        return
+    if not isinstance(value, (str, int, float, bool)):
+        fail()
+    if isinstance(value, float) and not math.isfinite(value):
+        fail()
+    value = str(value)
+    if "\r" in value or "\n" in value:
+        fail()
+    old = next((key for key in headers if key.lower() == name.lower()), None)
+    if old is not None:
+        del headers[old]
+    headers[name] = value
+
+put("Authorization", "Bearer " + api_key)
+for name, value in default_headers.items():
+    put(name, value)
+for name, value in extra_headers.items():
+    put(name, value)
+
+query_items = []
+for name, value in extra_query.items():
+    if not isinstance(name, str) or not name:
+        fail()
+    values = value if isinstance(value, list) else [value]
+    for item in values:
+        if item is None or not isinstance(item, (str, int, float, bool)):
+            fail()
+        if isinstance(item, float) and not math.isfinite(item):
+            fail()
+        query_items.append((name, str(item)))
+query = urlencode(query_items)
+
+try:
+    with open(headers_path, "w", encoding="utf-8", newline="\n") as fh:
+        for name, value in headers.items():
+            fh.write(f"{name}: {value}\n")
+    with open(body_path, "w", encoding="utf-8") as fh:
+        json.dump(extra_body, fh, separators=(",", ":"), allow_nan=False)
+    with open(query_path, "w", encoding="ascii") as fh:
+        fh.write(query)
+    with open(config_path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write("\n".join((provider, base_url, default_model, api_mode, "")))
+except (OSError, UnicodeError, ValueError):
+    fail()
+PY
+  ACTIVE_QUERY=$(cat "$_ACTIVE_QUERY_FILE")
+else
+  [[ -f "$CONFIG_FILE" ]] || die "Config not found: $CONFIG_FILE"
+
+  load_env_file "$ENV_FILE" "$(compgen -A variable)"
+
+  "${_PROBE_PYTHON[@]}" - "$CONFIG_FILE" "$_REQUEST_HEADERS" >"$_CFG_FILE" <<'PY' || die "Failed to parse $CONFIG_FILE"
 import ipaddress
 import os
 import re
@@ -385,6 +598,7 @@ os.chmod(headers_path, 0o600)
 for value in (provider, base_url, default_model, api_mode, context_length):
     print(value)
 PY
+fi
 
 PROVIDER=$(sed -n '1p' "$_CFG_FILE")
 BASE_URL=$(sed -n '2p' "$_CFG_FILE")
@@ -392,11 +606,15 @@ DEFAULT_MODEL=$(sed -n '3p' "$_CFG_FILE")
 API_MODE=$(sed -n '4p' "$_CFG_FILE")
 CONTEXT_LENGTH=$(sed -n '5p' "$_CFG_FILE")
 
-# Select the explicit override, or the fixed provider health default.
-if [[ -n "${TEST_MODEL:-}" ]]; then
+# An active route's model is the already-resolved conversation model.
+if (( ACTIVE_ROUTE_STDIN )); then
+  SELECTED_MODEL="$DEFAULT_MODEL"
+  MODEL_SOURCE="active route"
+elif [[ -n "${TEST_MODEL:-}" ]]; then
+  SELECTED_MODEL="$TEST_MODEL"
   MODEL_SOURCE="TEST_MODEL override"
 else
-  TEST_MODEL="$PROVIDER_HEALTH_MODEL"
+  SELECTED_MODEL="$PROVIDER_HEALTH_MODEL"
   MODEL_SOURCE="provider health default"
 fi
 
@@ -544,8 +762,6 @@ print("  Body summary: (omitted)")
 PY
 }
 
-SELECTED_MODEL="$TEST_MODEL"
-
 if [[ "$LIST_MODELS" == "1" ]]; then
   MODELS_HTTP="000"
   MODELS_ERR=""
@@ -606,11 +822,27 @@ echo
 api_request() {
   local endpoint="$1"
   local payload="$2"
-  local curl_err_file http_code
+  local curl_err_file http_code request_url request_body_file request_url_file escaped_url
+  local -a request_target
 
   RESPONSE_FILE=$(mk_temp "hermes-test-resp")
   RESPONSE_HEADERS_FILE=$(mk_temp "hermes-test-response-headers")
   curl_err_file=$(mk_temp "hermes-test-curl")
+  request_body_file=$(mk_temp "hermes-test-request-body")
+  printf '%s' "$payload" >"$request_body_file"
+  request_url="${BASE_URL}${endpoint}"
+  if (( ACTIVE_ROUTE_STDIN )) && [[ -n "$ACTIVE_QUERY" ]]; then
+    request_url+="?${ACTIVE_QUERY}"
+  fi
+  if (( ACTIVE_ROUTE_STDIN )); then
+    request_url_file=$(mk_temp "hermes-test-request-url")
+    escaped_url=${request_url//\\/\\\\}
+    escaped_url=${escaped_url//\"/\\\"}
+    printf 'url = "%s"\n' "$escaped_url" >"$request_url_file"
+    request_target=(--config "$request_url_file")
+  else
+    request_target=("$request_url")
+  fi
 
   if http_code=$(curl -sS --max-time "$CURL_TIMEOUT" \
     -o "$RESPONSE_FILE" \
@@ -618,8 +850,8 @@ api_request() {
     -w '%{http_code}' \
     -H @"$_REQUEST_HEADERS" \
     -H "Content-Type: application/json" \
-    -d "$payload" \
-    "${BASE_URL}${endpoint}" 2>"$curl_err_file"); then
+    --data-binary @"$request_body_file" \
+    "${request_target[@]}" 2>"$curl_err_file"); then
     :
   else
     http_code="000"
@@ -920,22 +1152,34 @@ try_responses() {
   # even a value of 1 yields HTTP 400 upstream_error (verified with
   # gpt-5.6-luna and gpt-5.6-sol). Omit the field entirely so the provider
   # default output-token limit applies. /chat/completions keeps max_tokens: 1.
-  payload=$(jq -nc --arg model "$SELECTED_MODEL" --arg effort "$REASONING_EFFORT" \
-    '{model: $model, instructions: "Reply with OK only.", input: "Reply OK.", store: false, stream: true, reasoning: {effort: $effort}}')
+  if (( ACTIVE_ROUTE_STDIN )); then
+    payload=$(jq -nc --arg model "$SELECTED_MODEL" --arg effort "$REASONING_EFFORT" \
+      --slurpfile overrides "$_ACTIVE_BODY_FILE" \
+      '({model: $model, instructions: "Reply with OK only.", input: "Reply OK.", store: false, stream: true, reasoning: {effort: $effort}} * $overrides[0]) | .model = $model | .input = "Reply OK."')
+  else
+    payload=$(jq -nc --arg model "$SELECTED_MODEL" --arg effort "$REASONING_EFFORT" \
+      '{model: $model, instructions: "Reply with OK only.", input: "Reply OK.", store: false, stream: true, reasoning: {effort: $effort}}')
+  fi
   api_request "/responses" "$payload"
 }
 
 try_chat() {
   local payload
-  payload=$(jq -nc --arg model "$SELECTED_MODEL" \
-    '{model: $model, messages: [{role: "user", content: "Reply OK."}], max_tokens: 1, stream: true}')
+  if (( ACTIVE_ROUTE_STDIN )); then
+    payload=$(jq -nc --arg model "$SELECTED_MODEL" \
+      --slurpfile overrides "$_ACTIVE_BODY_FILE" \
+      '({model: $model, messages: [{role: "user", content: "Reply OK."}], max_tokens: 1, stream: true} * $overrides[0]) | .model = $model | .messages = [{role: "user", content: "Reply OK."}]')
+  else
+    payload=$(jq -nc --arg model "$SELECTED_MODEL" \
+      '{model: $model, messages: [{role: "user", content: "Reply OK."}], max_tokens: 1, stream: true}')
+  fi
   api_request "/chat/completions" "$payload"
 }
 
 if [[ "$PRIMARY_ENDPOINT" == "responses" ]]; then
   try_responses
   require_response_body
-  if [[ "$RESPONSE_HTTP" != "200" ]] && should_fallback_endpoint "$RESPONSE_HTTP"; then
+  if (( ! ACTIVE_ROUTE_STDIN )) && [[ "$RESPONSE_HTTP" != "200" ]] && should_fallback_endpoint "$RESPONSE_HTTP"; then
     echo "Primary ${PRIMARY_ENDPOINT_SUFFIX} returned HTTP ${RESPONSE_HTTP}, trying $(endpoint_suffix chat_completions)..."
     try_chat
     require_response_body
@@ -943,7 +1187,7 @@ if [[ "$PRIMARY_ENDPOINT" == "responses" ]]; then
 else
   try_chat
   require_response_body
-  if [[ "$RESPONSE_HTTP" != "200" ]] && should_fallback_endpoint "$RESPONSE_HTTP"; then
+  if (( ! ACTIVE_ROUTE_STDIN )) && [[ "$RESPONSE_HTTP" != "200" ]] && should_fallback_endpoint "$RESPONSE_HTTP"; then
     echo "Primary ${PRIMARY_ENDPOINT_SUFFIX} returned HTTP ${RESPONSE_HTTP}, trying $(endpoint_suffix responses)..."
     try_responses
     require_response_body

@@ -12,6 +12,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -19,6 +20,8 @@ import pytest
 _PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _SCRIPT = _PLUGIN_ROOT / "test-provider.sh"
 _FAKE_API_KEY = "hermes-probe-test-fake-credential"
+_ACTIVE_API_KEY = "active-route-test-secret"
+_PROFILE_API_KEY = "hostile-profile-test-secret"
 
 
 def _sse_event(event_type: str, response_status: str) -> bytes:
@@ -91,6 +94,8 @@ class _ProbeServer(ThreadingHTTPServer):
         self.response_delay = 0
         self.header_modes: list[int] = []
         self.authorizations: list[str | None] = []
+        self.route_headers: list[str | None] = []
+        self.request_only_headers: list[str | None] = []
 
 
 class _SSEHandler(BaseHTTPRequestHandler):
@@ -103,6 +108,8 @@ class _SSEHandler(BaseHTTPRequestHandler):
             request_body = None
         self.server.requests.append((self.path, request_body))
         self.server.authorizations.append(self.headers.get("Authorization"))
+        self.server.route_headers.append(self.headers.get("X-Route-Precedence"))
+        self.server.request_only_headers.append(self.headers.get("X-Request-Only"))
         if hasattr(self.server, "temp_dir"):
             self.server.header_modes.extend(
                 path.stat().st_mode & 0o777
@@ -111,7 +118,8 @@ class _SSEHandler(BaseHTTPRequestHandler):
                 )
             )
 
-        if self.path not in {"/v1/responses", "/v1/chat/completions"}:
+        request_path = urlsplit(self.path).path
+        if request_path not in {"/v1/responses", "/v1/chat/completions"}:
             self.send_error(404)
             return
 
@@ -120,7 +128,7 @@ class _SSEHandler(BaseHTTPRequestHandler):
         if status != 200:
             payload = b'{"error":{"message":"fixture rejection"}}'
             content_type = "application/json"
-        elif self.path == "/v1/responses":
+        elif request_path == "/v1/responses":
             payload = self.server.sse_payload
             content_type = "text/event-stream"
         else:
@@ -323,6 +331,74 @@ def _run_script(probe, extra_env=None):
     )
 
 
+def _active_route(base_url: str, api_mode: str) -> dict:
+    return {
+        "model": {
+            "provider": "custom:active-route",
+            "default": "deepseek-active-model",
+            "base_url": base_url,
+            "api_mode": api_mode,
+            "api_key": _ACTIVE_API_KEY,
+            "default_headers": {"X-Route-Precedence": "model-header"},
+        },
+        "request_overrides": {
+            "extra_body": {
+                "model": "must-not-win",
+                "input": "must-not-win",
+                "messages": [{"role": "assistant", "content": "must-not-win"}],
+                "active_marker": "body-override-retained",
+            },
+            "extra_headers": {
+                "x-route-precedence": "request-override",
+                "X-Request-Only": "active-route",
+            },
+            "extra_query": {"region": "cn east", "tag": ["one", "two"], "routing_key": "private-query-token"},
+        },
+    }
+
+
+def _run_active_script(probe, route_input, *, extra_env=None):
+    env = _child_env(probe.home, probe.case_dir)
+    env.update(
+        {
+            "HERMES_HOME": str(probe.home),
+            "HERMES_DIR": str(probe.home),
+            "TEST_MODEL": "gpt-hostile-profile-override",
+            "LIST_MODELS": "1",
+        }
+    )
+    env.update(extra_env or {})
+    return subprocess.run(
+        ["bash", str(_SCRIPT), "--active-route-stdin"],
+        cwd=probe.case_dir,
+        env=env,
+        input=route_input,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+
+
+def _install_curl_argv_recorder(case_dir: Path, env: dict[str, str]) -> Path:
+    real_curl = shutil.which("curl", path=env["PATH"])
+    assert real_curl, "curl is required by test-provider.sh"
+    wrapper_dir = case_dir / "curl-wrapper"
+    wrapper_dir.mkdir(exist_ok=True)
+    wrapper = wrapper_dir / "curl"
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        'printf "%s\\n" "$@" >> "$CURL_ARGV_RECORD"\n'
+        'exec "$CURL_REAL" "$@"\n',
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o755)
+    env["CURL_REAL"] = real_curl
+    env["CURL_ARGV_RECORD"] = str(case_dir / "curl-argv.txt")
+    env["PATH"] = str(wrapper_dir) + os.pathsep + env["PATH"]
+    return Path(env["CURL_ARGV_RECORD"])
+
+
 def _run_cli(home: Path, case_dir: Path, *args: str):
     import hermes_constants
 
@@ -457,6 +533,123 @@ def test_endpoint_fallback_only_for_http_400(
     _assert_result(result, http_status == 400)
     expected_paths = [primary, alternate] if http_status == 400 else [primary]
     assert [path for path, _body in probe.server.requests] == expected_paths
+
+
+def _write_hostile_profile(home: Path, base_url: str) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "\n".join(
+            [
+                "model:",
+                "  provider: custom:hostile-profile",
+                f'  base_url: "{base_url}"',
+                "  default: gpt-profile-default",
+                "  api_mode: codex_responses",
+                f'  api_key: "{_PROFILE_API_KEY}"',
+                "  default_headers:",
+                '    X-Route-Precedence: "profile-header"',
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (home / ".env").write_text(
+        "DEEPSEEK_API_KEY=profile-env-fallback-secret\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "endpoint"),
+    [
+        ("codex_responses", "/v1/responses"),
+        ("chat_completions", "/v1/chat/completions"),
+    ],
+)
+@pytest.mark.parametrize("status", [200, 503])
+def test_active_route_uses_only_supplied_route_and_merges_overrides(
+    probe, api_mode, endpoint, status
+):
+    profile_server, profile_thread = _start_sse_server(_COMPLETED)
+    profile_base = f"http://127.0.0.1:{profile_server.server_port}/v1"
+    _write_hostile_profile(probe.home, profile_base)
+
+    query = "region=cn+east&tag=one&tag=two&routing_key=private-query-token"
+    expected_path = f"{endpoint}?{query}"
+    probe.server.status_by_path[expected_path] = status
+    route = _active_route(probe.base_url, api_mode)
+    env = _child_env(probe.home, probe.case_dir)
+    argv_record = _install_curl_argv_recorder(probe.case_dir, env)
+    try:
+        result = _run_active_script(probe, json.dumps(route), extra_env=env)
+    finally:
+        profile_server.shutdown()
+        profile_server.server_close()
+        profile_thread.join(timeout=3)
+
+    assert not profile_thread.is_alive(), "hostile profile server thread did not stop"
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == (0 if status == 200 else 1), output
+    assert ("[PASS]" if status == 200 else "[FAIL]") in output, output
+    assert "Test model: deepseek-active-model (active route)" in output
+    assert "Models endpoint: skipped" in output
+    for secret in (_ACTIVE_API_KEY, _PROFILE_API_KEY, "profile-env-fallback-secret", "private-query-token"):
+        assert secret not in output, "probe printed a credential"
+        assert secret not in argv_record.read_text(encoding="utf-8"), (
+            "curl received a credential in argv"
+        )
+
+    assert profile_server.requests == [], "probe contacted the hostile GPT profile route"
+    assert [path for path, _body in probe.server.requests] == [expected_path]
+    body = probe.server.requests[0][1]
+    assert isinstance(body, dict)
+    assert body["model"] == "deepseek-active-model"
+    assert body["active_marker"] == "body-override-retained"
+    if api_mode == "codex_responses":
+        assert body["input"] == "Reply OK."
+    else:
+        assert body["messages"] == [{"role": "user", "content": "Reply OK."}]
+    assert probe.server.authorizations == [f"Bearer {_ACTIVE_API_KEY}"]
+    assert probe.server.route_headers == ["request-override"]
+    assert probe.server.request_only_headers == ["active-route"]
+    assert probe.server.header_modes == [0o600]
+
+
+@pytest.mark.parametrize(
+    ("api_mode", "endpoint"),
+    [
+        ("codex_responses", "/v1/responses"),
+        ("chat_completions", "/v1/chat/completions"),
+    ],
+)
+def test_active_route_http_400_never_falls_back(probe, api_mode, endpoint):
+    route = _active_route(probe.base_url, api_mode)
+    expected_path = endpoint + "?region=cn+east&tag=one&tag=two&routing_key=private-query-token"
+    probe.server.status_by_path[expected_path] = 400
+    result = _run_active_script(probe, json.dumps(route))
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode == 1, output
+    assert "[FAIL]" in output
+    assert [path for path, _body in probe.server.requests] == [expected_path]
+    assert probe.server.authorizations == [f"Bearer {_ACTIVE_API_KEY}"]
+
+
+@pytest.mark.parametrize(
+    "route_input",
+    [
+        '{"model":{"provider":"custom:x","default":"x","base_url":"http://127.0.0.1:1/v1","api_mode":"future_transport","api_key":"active-route-test-secret"}}',
+        '{"model":{"provider":"custom:x","default":"x","base_url":"http://127.0.0.1:1/v1","api_mode":"codex_responses","api_key":"active-route-test-secret"',
+        '{"model":{"provider":"custom:x","default":"x","base_url":"http://127.0.0.1:1/v1","api_mode":"codex_responses","api_key":"active-route-test-secret"},"second":{}}',
+        '{"model":{"provider":"custom:x","provider":"custom:y","default":"x","base_url":"http://127.0.0.1:1/v1","api_mode":"codex_responses","api_key":"active-route-test-secret"}}',
+    ],
+    ids=["unsupported-mode", "malformed-json", "unexpected-route-field", "duplicate-field"],
+)
+def test_active_route_invalid_input_fails_before_network(probe, route_input):
+    result = _run_active_script(probe, route_input)
+    output = f"{result.stdout}\n{result.stderr}"
+    assert result.returncode != 0, output
+    assert "[FAIL] Invalid active route input" in output
+    assert _ACTIVE_API_KEY not in output
+    assert probe.server.requests == [], "invalid active route triggered a request"
 
 
 def test_env_file_is_not_executed_and_headers_are_private(probe):

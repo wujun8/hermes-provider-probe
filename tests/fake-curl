@@ -27,7 +27,7 @@ header_files = []
 i = 0
 while i < len(argv):
     arg = argv[i]
-    if arg in ("-o", "-D", "-d", "-H", "-w", "--max-time"):
+    if arg in ("-o", "-D", "-d", "--data-binary", "--config", "-H", "-w", "--max-time"):
         if i + 1 >= len(argv):
             sys.stderr.write("fake curl: missing value for %s\n" % arg)
             sys.exit(2)
@@ -36,8 +36,15 @@ while i < len(argv):
             body_path = value
         elif arg == "-D":
             headers_path = value
-        elif arg == "-d":
-            payload = value
+        elif arg in ("-d", "--data-binary"):
+            if value.startswith("@"):
+                with open(value[1:], encoding="utf-8") as request_file:
+                    payload = request_file.read()
+            else:
+                payload = value
+        elif arg == "--config":
+            with open(value, encoding="utf-8") as curl_config:
+                url = json.loads(curl_config.read().split("=", 1)[1].strip())
         elif arg == "-H" and value.startswith("@"):
             header_files.append(value[1:])
         i += 2

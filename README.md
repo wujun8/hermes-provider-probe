@@ -63,6 +63,31 @@ HERMES_HOME=/path/to/profile HERMES_PYTHON=/path/to/python \
   bash /path/to/hermes-provider-probe/test-provider.sh
 ```
 
+Callers that already hold Hermes' resolved active route can select it directly
+without reading a profile:
+
+```sh
+private-route-resolver | bash /path/to/hermes-provider-probe/test-provider.sh \
+  --active-route-stdin
+```
+
+This mode reads exactly one JSON object from stdin with `model.provider`,
+`model.default`, `model.base_url`, `model.api_mode`, `model.api_key`, optional
+`model.default_headers`, and optional `request_overrides.extra_body`,
+`request_overrides.extra_headers`, and `request_overrides.extra_query`. It
+supports `chat_completions` and `codex_responses`; malformed input and any
+other transport fail before a request. The route is treated as already
+resolved: profile files, `TEST_MODEL`, model-list settings, and environment
+credential fallbacks are ignored. Model defaults and request override headers
+are merged in that order after the API-key authorization header. Extra body
+fields merge into the health payload, while its selected model and health
+input/messages remain fixed. Extra query values are URL-encoded on the chosen
+endpoint. HTTP 400 does not switch transports in this mode.
+
+The API key is part of the private stdin object, never a command-line argument.
+The script keeps request headers in a mode-0600 temporary file and removes it
+on exit, as in profile mode.
+
 If `HERMES_PYTHON` is unset, direct execution uses `command -v python3`.
 Existing script controls remain available: `HERMES_DIR` selects the profile
 before `HERMES_HOME`, `TEST_MODEL` overrides the model, `CURL_TIMEOUT` sets the
@@ -94,17 +119,19 @@ installing or testing this plugin.
 
 ## Verification
 
-Run from an official Hermes checkout with a separate test interpreter that
-includes the declared PyYAML dependency:
+Run from this plugin directory with a Python interpreter that includes the
+declared PyYAML dependency:
 
 ```sh
-HERMES_PYTHON=/path/to/test-python bash scripts/run_tests.sh \
-  /absolute/path/to/hermes-provider-probe/tests/test_provider_health.py -j 1
+HERMES_PYTHON=/path/to/test-python /path/to/test-python -m pytest \
+  tests/test_provider_health.py -q
+bash tests/run.sh
 bash -n /absolute/path/to/hermes-provider-probe/test-provider.sh
 ```
 
 The tests use temporary homes and real local HTTP servers. They cover the nine
 Responses SSE regression cases, both endpoint directions' 400-only fallback,
-credential handling, real plugin discovery, the actual CLI parser, subprocess
-probe execution, option forwarding, exit codes, and profile resolution after
-registration. They do not contact production providers.
+credential handling, active-route isolation and transport selection, real
+plugin discovery, the actual CLI parser, subprocess probe execution, option
+forwarding, exit codes, and profile resolution after registration. They do not
+contact production providers.
